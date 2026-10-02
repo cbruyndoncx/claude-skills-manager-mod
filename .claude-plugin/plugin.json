@@ -1,0 +1,18 @@
+{
+  "name": "skills-manager",
+  "version": "0.2.0",
+  "description": "Manage AI agent skills (SKILL.md): list, toggle, categorise, install from GitHub/monorepo/ZIP/local/marketplace, update, freeze, scan, export and index. Port of the Obsidian Skills Manager plugin.",
+  "author": { "name": "cbruyndoncx" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "skillsDir": { "type": "string", "title": "Skills directory", "description": "Folder holding one sub-folder per skill, relative to the working directory or absolute", "default": ".claude/skills" },
+    "githubPat": { "type": "string", "title": "GitHub PAT", "description": "Personal access token for private repos and higher rate limits", "sensitive": true, "default": "" },
+    "autoUpdate": { "type": "boolean", "title": "Check for updates on start", "description": "Check unfrozen GitHub skills 60s after the session starts", "default": true },
+    "defaultCategory": { "type": "string", "title": "Default category", "description": "Category for skills without one", "default": "uncategorized" },
+    "customCategories": { "type": "string", "title": "Custom categories", "description": "Comma-separated extra categories", "default": "" },
+    "generateSkillsIndex": { "type": "boolean", "title": "Generate SKILLS.md", "description": "Write a skill index at the working directory root after every change", "default": true },
+    "crossToolExportEnabled": { "type": "boolean", "title": "Cross-tool export", "description": "Export enabled skills to other AI tools after every change", "default": false },
+    "crossToolExport": { "type": "string", "title": "Export targets", "description": "Comma-separated: cursor, copilot, windsurf, cline", "default": "" },
+    "skillsmpApiKey": { "type": "string", "title": "SkillsMP API key", "description": "Enables the SkillsMP marketplace (skillsmp.com/settings/api)", "sensitive": true, "default": "" }
+  }
+}
