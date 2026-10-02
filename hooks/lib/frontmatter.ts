@@ -15,6 +15,31 @@ export function parseFrontmatter(content: string): Record<string, string> {
   return fields
 }
 
+/** A list field: inline `[a, b]`, a block of `- a` lines, or a single scalar. */
+export function parseList(content: string, key: string): string[] {
+  const fm = FM.exec(content)?.[1]
+  if (fm === undefined) return []
+  const esc = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const m = new RegExp(`^${esc}:[ \\t]*(.*)$((?:\\r?\\n[ \\t]*-.*)*)`, 'm').exec(fm)
+  if (!m) return []
+  const inline = m[1]!.trim()
+  const clean = (v: string) => v.trim().replace(/^["']|["']$/g, '')
+  if (inline.startsWith('[')) return inline.replace(/^\[|\]$/g, '').split(',').map(clean).filter(Boolean)
+  if (inline) return [clean(inline)]
+  return m[2]!.split(/\r?\n/).map(l => l.replace(/^[ \t]*-[ \t]*/, '')).map(clean).filter(Boolean)
+}
+
+/** Write a list field as inline YAML (`key: [a, b]`), replacing any inline or block form. */
+export function setList(content: string, key: string, values: string[]): string {
+  const fm = FM.exec(content)?.[1]
+  if (fm === undefined) return content
+  const esc = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const line = `${key}: [${values.join(', ')}]`
+  const block = new RegExp(`^${esc}:[ \\t]*.*$(?:\\r?\\n[ \\t]*-.*)*`, 'm')
+  const next = block.test(fm) ? fm.replace(block, () => line) : `${fm}\n${line}`
+  return content.replace(fm, () => next)
+}
+
 const strip = (v?: string) => (v ? v.replace(/^["']|["']$/g, '') : '')
 const toBool = (v: string | undefined, fallback: boolean) =>
   v === undefined ? fallback : ['true', 'yes'].includes(strip(v).toLowerCase())
@@ -40,6 +65,7 @@ export function toSkillMeta(content: string, defaultCategory: string): SkillMeta
     license: opt('license'),
     compatibility: opt('compatibility'),
     allowedTools: opt('allowed-tools'),
+    valueChains: parseList(content, 'value-chains'),
   }
 }
 

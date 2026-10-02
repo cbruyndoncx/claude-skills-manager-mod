@@ -3,12 +3,14 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { AddForm, Detail, Market, RegistrySkill, RegistryType, SkillRow, SkillState, Tab, View } from '../types'
+import type { AddForm, ChainView, Detail, Market, PlaybookDetail, PlaybookRow, PlaybookView, RegistrySkill, RegistryType, SkillRow, SkillState, Tab, View } from '../types'
+import { chainList, chainMatrix, formatMatrix } from './lib/chains'
 import { buildExport, buildIndex, EXPORT_TARGETS } from './lib/exporter'
-import { ensureFrontmatter, extractBody, FRONTMATTER_TEMPLATE, setField, TEMPLATE_FILENAME, toSkillMeta } from './lib/frontmatter'
+import { ensureFrontmatter, extractBody, FRONTMATTER_TEMPLATE, setField, setList, TEMPLATE_FILENAME, toSkillMeta } from './lib/frontmatter'
 import type { FrontmatterDefaults } from './lib/frontmatter'
 import { encodePath, matchByName, parseRepo, parseSkillRef, pickSkillSubpath, sortReleases } from './lib/github'
 import type { Release } from './lib/github'
+import { filterPlaybooks, findPlaybook, runPrompt, toPlaybook } from './lib/playbooks'
 import { filterSkills, parseRegistry, REGISTRIES, registryRequest } from './lib/registry'
 import { scanSkill } from './lib/security'
 import { isNewer } from './lib/semver'
@@ -29,6 +31,12 @@ const market = atom({ plugin: 'skills-manager', key: 'market' } as const, {
 } as Market)
 const addForm = atom({ plugin: 'skills-manager', key: 'add' } as const, { input: '', versions: [], version: '', status: '', zip: null } as AddForm)
 const busy = atom({ plugin: 'skills-manager', key: 'busy' } as const, '')
+const playbooks = atom({ plugin: 'skills-manager', key: 'playbooks' } as const, [] as PlaybookRow[])
+const pbView = atom({ plugin: 'skills-manager', key: 'pbView' } as const, { search: '', status: '', chain: '', maturity: '', selected: '' } as PlaybookView)
+const pbDetail = atom({ plugin: 'skills-manager', key: 'pbDetail' } as const, null as PlaybookDetail)
+const chainView = atom({ plugin: 'skills-manager', key: 'chainView' } as const, { expanded: [], showEmpty: true } as ChainView)
+const PINS_KEY = 'pinnedPlaybooks'
+const PLAYBOOK_STATUSES = ['draft', 'active', 'retired']
 
 type Opts = {
   skillsDir: string
@@ -40,6 +48,8 @@ type Opts = {
   crossToolExportEnabled: boolean
   crossToolExport: string[]
   skillsmpApiKey: string
+  playbookFolders: string[]
+  valueChains: string[]
 }
 
 const list = (v: unknown) => String(v ?? '').split(',').map(s => s.trim()).filter(Boolean)
@@ -58,6 +68,8 @@ function readOptions(raw: Record<string, unknown>): Opts {
     crossToolExportEnabled: raw.crossToolExportEnabled === true,
     crossToolExport: list(raw.crossToolExport).map(s => s.toLowerCase()),
     skillsmpApiKey: String(raw.skillsmpApiKey || ''),
+    playbookFolders: list(raw.playbookFolders || '00-CORE/Playbooks, 20-COMPANY/03-PROCESSES/Playbooks, 10-ME/Playbooks, 30-CLIENTS').map(f => f.replace(/\/+$/, '')),
+    valueChains: list(raw.valueChains).map(c => c.toLowerCase()),
   }
 }
 
@@ -272,6 +284,96 @@ async function loadDetail($: any, folder: string) {
   }
   const body = extractBody(text)
   await update($, detail, () => ({ folder, files, body, scan: scanSkill(body, scripts) }))
+}
+
+// ─── Playbooks and value chains ──────────────────────────────
+
+async function loadPins($: any): Promise<string[]> {
+  return ((await $.store.get(PINS_KEY)) as string[] | undefined) ?? []
+}
+
+/** Notes with `type: playbook` under the playbook folders (template folders skipped). */
+async function scanPlaybooks($: any): Promise<PlaybookRow[]> {
+  const pins = await loadPins($)
+  const rows: PlaybookRow[] = []
+  const seen = new Set<string>()
+  for (const root of O.playbookFolders) {
+    for (const f of await walk($, root, '', 4)) {
+      const path = `${root}/${f}`
+      if (!f.endsWith('.md') || seen.has(path) || /(^|\/)templates?\//i.test(path)) continue
+      seen.add(path)
+      const text = await readText($, path)
+      const p = text === undefined ? null : toPlaybook(path, text, pins)
+      if (p) rows.push(p)
+    }
+  }
+  return rows.sort((a, b) => a.title.localeCompare(b.title))
+}
+
+async function refreshPlaybooks($: any): Promise<PlaybookRow[]> {
+  const rows = await scanPlaybooks($)
+  await update($, playbooks, () => rows)
+  return rows
+}
+
+async function togglePin($: any, path: string): Promise<boolean> {
+  const pins = await loadPins($)
+  const isPinned = !pins.includes(path)
+  await $.store.set(PINS_KEY, isPinned ? [...pins, path] : pins.filter(p => p !== path))
+  await refreshPlaybooks($)
+  return isPinned
+}
+
+async function setPlaybookField($: any, path: string, field: string, value: string) {
+  const text = await readText($, path)
+  if (text === undefined) throw new Error(`Cannot read ${path}`)
+  const next = setField(text, field, value)
+  if (next !== text) await $.fs.write(path, next)
+  await refreshPlaybooks($)
+  if ((await read($, pbDetail))?.path === path) await loadPlaybookDetail($, path)
+}
+
+async function loadPlaybookDetail($: any, path: string) {
+  const text = (await readText($, path)) ?? ''
+  await update($, pbDetail, () => ({ path, body: extractBody(text) }))
+}
+
+/** The prompt that runs a playbook (the vault's /playbook-runner skill when installed). */
+async function playbookPrompt($: any, p: PlaybookRow, extra: string): Promise<string> {
+  return runPrompt(p, await $.fs.exists(`${skillDir('playbook-runner')}/SKILL.md`), extra)
+}
+
+/**
+ * Queue the playbook as its own turn. Submitted from a timer, not inline: a
+ * command or press hook cannot submit while the engine is holding it.
+ */
+async function runPlaybook($: any, p: PlaybookRow, extra = ''): Promise<string> {
+  const text = await playbookPrompt($, p, extra)
+  $.clock.after(0, () => {
+    void $.prompt.submit({ text }).catch((e: unknown) => $.ui.toast(`Could not start the playbook: ${errText(e)}`))
+  })
+  return text
+}
+
+async function setSkillChains($: any, folder: string, chains: string[]) {
+  const path = `${skillDir(folder)}/SKILL.md`
+  const text = await readText($, path)
+  if (text === undefined) throw new Error(`Cannot read ${path}`)
+  const next = setList(text, 'value-chains', [...new Set(chains)])
+  if (next !== text) await $.fs.write(path, next)
+  await afterChange($)
+  if ((await read($, detail))?.folder === folder) await loadDetail($, folder)
+}
+
+async function chainRows($: any) {
+  const sk = await refresh($)
+  const pbs = await refreshPlaybooks($)
+  return chainMatrix(chainList(O.valueChains, sk, pbs), sk, pbs)
+}
+
+function formatPlaybooks(rows: PlaybookRow[]): string {
+  if (rows.length === 0) return `No playbooks (type: playbook) under ${O.playbookFolders.join(', ')}.`
+  return rows.map(p => `${p.isPinned ? '★ ' : ''}${p.title}  (${[p.status, p.valueChain, p.steps !== undefined && `${p.steps} steps`, p.duration].filter(Boolean).join(', ')})${p.trigger ? `  — ${p.trigger}` : ''}`).join('\n')
 }
 
 // ─── GitHub ──────────────────────────────────────────────────
@@ -652,8 +754,18 @@ function targetsOf(rows: SkillRow[], target: string): string[] {
 }
 
 /** One action, shared by the slash command and the model tool. */
-async function act($: any, action: string, arg: string, extra: string): Promise<string> {
+async function act($: any, action: string, arg: string, extra: string, isFromTool = false): Promise<string> {
   const rows = await refresh($)
+  // Playbook titles have spaces: try the whole text first, else the first word with the rest as context.
+  const needPlaybook = async (): Promise<{ p: PlaybookRow; rest: string }> => {
+    const pbs = await refreshPlaybooks($)
+    const full = [arg, extra].filter(Boolean).join(' ')
+    const whole = findPlaybook(pbs, full)
+    if (whole) return { p: whole, rest: '' }
+    const first = findPlaybook(pbs, arg)
+    if (first) return { p: first, rest: extra }
+    throw new Error(`No playbook named "${full}" under ${O.playbookFolders.join(', ')}`)
+  }
   const need = (): SkillRow => {
     const r = findSkill(rows, arg)
     if (!r) throw new Error(`No skill named "${arg}" in ${O.skillsDir}`)
@@ -733,6 +845,56 @@ async function act($: any, action: string, arg: string, extra: string): Promise<
     case 'index':
       await writeIndex($, rows)
       return 'Wrote SKILLS.md.'
+    case 'playbooks': {
+      const pbs = await refreshPlaybooks($)
+      const q = [arg, extra].filter(Boolean).join(' ')
+      return formatPlaybooks(filterPlaybooks(pbs, { search: q, status: '', chain: '', maturity: '', selected: '' }))
+    }
+    case 'playbook': {
+      const { p } = await needPlaybook()
+      const body = extractBody((await readText($, p.path)) ?? '')
+      const meta = [['Path', p.path], ['Status', p.status], ['Trigger', p.trigger], ['Outcome', p.outcome], ['Value chain', p.valueChain],
+        ['Coverage', p.coverage.join(', ')], ['Maturity', p.maturity.join(', ')], ['Steps', p.steps], ['Duration', p.duration], ['Tier', p.pricingTier], ['Tags', p.tags.join(', ')]]
+      return `${meta.filter(([, v]) => v !== undefined && v !== '').map(([k, v]) => `${k}: ${v}`).join('\n')}\n\n${body.slice(0, 4000)}`
+    }
+    case 'run': {
+      const { p, rest } = await needPlaybook()
+      if (isFromTool) return `To run "${p.title}", follow this:\n${await playbookPrompt($, p, rest)}`
+      const text = await runPlaybook($, p, rest)
+      return `Running playbook "${p.title}": ${text.split('\n')[0]}`
+    }
+    case 'pin': {
+      const { p } = await needPlaybook()
+      return `${p.title} ${(await togglePin($, p.path)) ? 'pinned' : 'unpinned'}.`
+    }
+    case 'playbook-status':
+    case 'playbook-chain': {
+      const words = extra.split(/\s+/).filter(Boolean)
+      const value = words.pop() ?? ''
+      const pbs = await refreshPlaybooks($)
+      const p = findPlaybook(pbs, [arg, ...words].join(' ')) ?? findPlaybook(pbs, arg)
+      if (!p || !value) throw new Error(`Usage: ${action} <playbook> <${action === 'playbook-status' ? PLAYBOOK_STATUSES.join('|') : 'chain|none'}>`)
+      const field = action === 'playbook-status' ? 'status' : 'value-chain'
+      await setPlaybookField($, p.path, field, value === 'none' ? '' : value)
+      return `${p.title}: ${field} → ${value}`
+    }
+    case 'chains': {
+      const matrix = await chainRows($)
+      if (!arg) return formatMatrix(matrix)
+      const r = matrix.find(c => c.id === arg || c.label.toLowerCase() === [arg, extra].join(' ').trim().toLowerCase())
+      if (!r) throw new Error(`Unknown value chain "${arg}". Known: ${matrix.map(c => c.id).filter(Boolean).join(', ')}`)
+      return [`${r.label}${r.stages.length ? ` — stages covered: ${r.stages.join(', ')}` : ''}`,
+        `Playbooks (${r.playbooks.length}):`, ...r.playbooks.map(p => `  ${p.title} (${p.status}${p.coverage.length ? `; ${p.coverage.join(', ')}` : ''})`),
+        `Skills (${r.skills.length}):`, ...r.skills.map(s => `  ${s.folder}${s.meta.disableModelInvocation ? ' (off)' : ''}`)].join('\n')
+    }
+    case 'chain-add':
+    case 'chain-remove': {
+      const r = need()
+      if (!extra) throw new Error(`Usage: ${action} <skill> <chain>`)
+      const chains = action === 'chain-add' ? [...r.meta.valueChains, extra] : r.meta.valueChains.filter(c => c !== extra)
+      await setSkillChains($, r.folder, chains)
+      return `${r.folder}: value-chains → [${[...new Set(chains)].join(', ')}]`
+    }
     case 'browse': {
       await update($, market, m => ({ ...m, search: arg }))
       await loadMarket($, false)
@@ -751,7 +913,11 @@ const HELP = `/skills — open the Skills Manager pane
 /skills enable|disable <skill|category|all> · invocable <skill> on|off · category <skill> <name>
 /skills install <owner/repo | owner/repo/path | GitHub URL | skills.sh URL | folder | file.zip> [version]
 /skills versions <owner/repo> · check-updates [skill] · update [skill|all] [version] · freeze <skill>
-/skills delete <skill> · browse [query] · export · index`
+/skills delete <skill> · browse [query] · export · index
+/skills playbooks [query] · playbook <name> · run <name> [context] · pin <name>
+/skills playbook-status <name> draft|active|retired · playbook-chain <name> <chain|none>
+/skills chains [chain] · chain-add <skill> <chain> · chain-remove <skill> <chain>
+/playbook [name [context]] — open the Playbooks tab, or run a playbook`
 
 // ─── Rendering ───────────────────────────────────────────────
 
@@ -762,14 +928,22 @@ function categoriesFor(current: string): { value: string; label: string }[] {
 function renderTabs(ui: any, $: any, v: View, b: string) {
   const { Box, Button, Text } = ui
   const tab = (id: Tab, label: string) => (
-    <Button key={`tab-${id}`} label={label} variant={v.tab === id ? 'primary' : undefined} onPress={() => update($, view, x => ({ ...x, tab: id }))} />
+    <Button key={`tab-${id}`} label={label} variant={v.tab === id ? 'primary' : undefined} onPress={async () => {
+      await update($, view, x => ({ ...x, tab: id }))
+      if (id === 'playbooks' || id === 'chains') await withBusy($, 'Scan playbooks', () => refreshPlaybooks($))
+    }} />
   )
   return (
     <Box flexDirection="row" gap={1}>
       {tab('installed', 'Installed')}
+      {tab('playbooks', 'Playbooks')}
+      {tab('chains', 'Value chains')}
       {tab('marketplace', 'Marketplace')}
       {tab('add', 'Add skill')}
-      <Button key="rescan" label="Rescan" dimColor onPress={() => withBusy($, 'Rescan', () => afterChange($))} />
+      <Button key="rescan" label="Rescan" dimColor onPress={() => withBusy($, 'Rescan', async () => {
+        await afterChange($)
+        await refreshPlaybooks($)
+      })} />
       {b ? <Text color="yellow">{b}…</Text> : <Text dimColor>{O.skillsDir}</Text>}
     </Box>
   )
@@ -782,6 +956,7 @@ function renderDetail(ui: any, $: any, r: SkillRow, d: Detail, v: View, hasField
   const pairs: [string, string | undefined][] = [
     ['Category', m.category], ['Version', m.version], ['Source', s?.source ?? m.source], ['Origin', m.origin],
     ['Repo', s?.repo ?? m.originRepo], ['License', m.license], ['Compatibility', m.compatibility], ['Allowed tools', m.allowedTools],
+    ['Value chains', m.valueChains.join(', ') || undefined],
     ['Installed', s?.installedAt?.slice(0, 10)], ['Updated', s?.lastUpdated?.slice(0, 10)], ['Frozen', s?.frozen ? 'yes' : undefined],
   ]
   const available = v.updates[r.folder]
@@ -789,6 +964,14 @@ function renderDetail(ui: any, $: any, r: SkillRow, d: Detail, v: View, hasField
     <Box key={`detail-${r.folder}`} flexDirection="column" paddingLeft={4} marginBottom={1}>
       <Text>{m.description}</Text>
       {pairs.filter(([, val]) => val).map(([k, val]) => <Text key={`m-${k}`} dimColor>{k}: {val}</Text>)}
+      {m.valueChains.length > 0 && (
+        <Box flexDirection="row" gap={1}>
+          {m.valueChains.map(c => (
+            <Button key={`vcx-${r.folder}-${c}`} plain dimColor label={`× ${c}`}
+              onPress={() => withBusy($, 'Value chain', () => setSkillChains($, r.folder, m.valueChains.filter(x => x !== c)))} />
+          ))}
+        </Box>
+      )}
       <Box flexDirection="row" gap={1}>
         {hasFields && (
           <Select key={`cat-${r.folder}`} label="Category" value={m.category} options={categoriesFor(m.category)}
@@ -798,6 +981,11 @@ function renderDetail(ui: any, $: any, r: SkillRow, d: Detail, v: View, hasField
           onPress={() => withBusy($, 'Toggle', () => setEnabled($, [r.folder], m.disableModelInvocation))} />
         <Button key={`inv-${r.folder}`} label={`User-invocable: ${m.userInvocable ? 'on' : 'off'}`}
           onPress={() => withBusy($, 'Toggle', () => setFieldAndRefresh($, r.folder, 'user-invocable', m.userInvocable ? 'false' : 'true'))} />
+        {hasFields && (
+          <Select key={`vc-${r.folder}`} label="Add value chain" value=""
+            options={[{ value: '', label: '—' }, ...chainList(O.valueChains, [], []).filter(c => !m.valueChains.includes(c.id)).map(c => ({ value: c.id, label: c.label }))]}
+            onSelect={(c: string) => c ? withBusy($, 'Value chain', () => setSkillChains($, r.folder, [...m.valueChains, c])) : undefined} />
+        )}
         <Link key={`edit-${r.folder}`} href={`file://${absolute(`${skillDir(r.folder)}/SKILL.md`)}`} label="Edit SKILL.md" />
         {available && s?.source === 'github' && !s.frozen && (
           <Button key={`upd-${r.folder}`} variant="primary" label={`Update to ${available}`}
@@ -1063,6 +1251,147 @@ function renderAdd(ui: any, $: any, a: AddForm, hasFields: boolean) {
   )
 }
 
+function renderPlaybooks(ui: any, $: any, rows: PlaybookRow[], v: PlaybookView, d: PlaybookDetail, hasFields: boolean) {
+  const { Box, Button, Text, Input, Select, Markdown, Link } = ui
+  const shown = filterPlaybooks(rows, v)
+  const uniq = (xs: string[]) => [...new Set(xs.filter(Boolean))].sort()
+  const opts = (all: string, xs: string[]) => [{ value: '', label: all }, ...xs.map(x => ({ value: x, label: x }))]
+  const chainIds = chainList(O.valueChains, [], rows).map(c => c.id)
+  return (
+    <Box flexDirection="column">
+      {hasFields && (
+        <Box flexDirection="row" gap={1}>
+          <Input key="pbsearch" placeholder="Search playbooks" value={v.search} submitLabel="filter"
+            onInput={(q: string) => update($, pbView, x => ({ ...x, search: q }))} onSubmit={(q: string) => update($, pbView, x => ({ ...x, search: q }))} />
+          <Select key="pbstatus" label="Status" value={v.status} options={opts('All', uniq([...PLAYBOOK_STATUSES, ...rows.map(p => p.status)]))}
+            onSelect={(x: string) => update($, pbView, y => ({ ...y, status: x }))} />
+          <Select key="pbchain" label="Chain" value={v.chain} options={[...opts('All', uniq(rows.map(p => p.valueChain))), { value: '(none)', label: '(none)' }]}
+            onSelect={(x: string) => update($, pbView, y => ({ ...y, chain: x }))} />
+          <Select key="pbmat" label="Maturity" value={v.maturity} options={opts('All', uniq(rows.flatMap(p => p.maturity)))}
+            onSelect={(x: string) => update($, pbView, y => ({ ...y, maturity: x }))} />
+        </Box>
+      )}
+      <Text dimColor>
+        {rows.length} playbooks · {rows.filter(p => p.status === 'active').length} active · {rows.filter(p => p.isPinned).length} pinned{shown.length !== rows.length ? ` · ${shown.length} shown` : ''}
+      </Text>
+      {rows.length === 0 && <Text dimColor>No notes with type: playbook under {O.playbookFolders.join(', ')}. Set “Playbook folders” in /config.</Text>}
+      {shown.map(p => {
+        const isOpen = v.selected === p.path
+        return (
+          <Box key={`pbrow-${p.path}`} flexDirection="column">
+            <Box flexDirection="row" gap={1}>
+              <Button key={`pin-${p.path}`} plain label={p.isPinned ? '★' : '☆'} onPress={() => togglePin($, p.path)} />
+              <Button key={`run-${p.path}`} plain label="▶ run" onPress={() => withBusy($, `Run ${p.title}`, async () => {
+                await runPlaybook($, p)
+                $.ui.toast(`Running playbook: ${p.title}`)
+              })} />
+              <Button key={`pb-${p.path}`} plain label={`${isOpen ? '▾' : '▸'} ${p.title}`} dimColor={p.status === 'retired'}
+                onPress={async () => {
+                  await update($, pbView, x => ({ ...x, selected: x.selected === p.path ? '' : p.path }))
+                  if (!isOpen) await loadPlaybookDetail($, p.path)
+                }} />
+              <Text dimColor>{[p.status, p.valueChain, p.steps !== undefined && `${p.steps} steps`, p.duration].filter(Boolean).join(' · ')}</Text>
+            </Box>
+            {isOpen && (
+              <Box key={`pbd-${p.path}`} flexDirection="column" paddingLeft={4} marginBottom={1}>
+                {([['Trigger', p.trigger], ['Outcome', p.outcome], ['Coverage', p.coverage.join(', ')], ['Maturity', p.maturity.join(', ')],
+                  ['Tier', p.pricingTier], ['Tags', p.tags.join(', ')], ['Path', p.path]] as [string, string][])
+                  .filter(([, val]) => val).map(([k, val]) => <Text key={`pbm-${k}`} dimColor={k !== 'Trigger' && k !== 'Outcome'}>{k}: {val}</Text>)}
+                <Box flexDirection="row" gap={1}>
+                  {hasFields && (
+                    <Select key={`pbs-${p.path}`} label="Status" value={p.status} options={uniq([...PLAYBOOK_STATUSES, p.status]).map(x => ({ value: x, label: x }))}
+                      onSelect={(x: string) => withBusy($, 'Status', () => setPlaybookField($, p.path, 'status', x))} />
+                  )}
+                  {hasFields && (
+                    <Select key={`pbc-${p.path}`} label="Value chain" value={p.valueChain}
+                      options={[{ value: '', label: '(none)' }, ...uniq([...chainIds, p.valueChain]).map(x => ({ value: x, label: x }))]}
+                      onSelect={(x: string) => withBusy($, 'Value chain', () => setPlaybookField($, p.path, 'value-chain', x))} />
+                  )}
+                  <Button key={`pbfill-${p.path}`} label="Draft in prompt" onPress={async () => {
+                    await $.prompt.fill({ text: await playbookPrompt($, p, '') })
+                  }} />
+                  <Link key={`pbedit-${p.path}`} href={`file://${absolute(p.path)}`} label="Edit note" />
+                </Box>
+                {d?.path === p.path ? (
+                  <Markdown key={`pbmd-${p.path}`} text={d.body.length > 4000 ? `${d.body.slice(0, 4000)}\n\n…` : d.body || '_(empty)_'} />
+                ) : (
+                  <Text dimColor>Loading…</Text>
+                )}
+              </Box>
+            )}
+          </Box>
+        )
+      })}
+    </Box>
+  )
+}
+
+function renderChains(ui: any, $: any, sk: SkillRow[], pbs: PlaybookRow[], cv: ChainView, hasFields: boolean) {
+  const { Box, Button, Text, Select } = ui
+  const chains = chainList(O.valueChains, sk, pbs)
+  const rows = chainMatrix(chains, sk, pbs).filter(r => cv.showEmpty || r.playbooks.length + r.skills.length > 0)
+  const covered = rows.filter(r => r.id && r.playbooks.length > 0 && r.skills.length > 0).length
+  const toggle = (id: string) => update($, chainView, x => ({ ...x, expanded: x.expanded.includes(id) ? x.expanded.filter(e => e !== id) : [...x.expanded, id] }))
+  return (
+    <Box flexDirection="column">
+      <Box flexDirection="row" gap={1}>
+        <Text dimColor>{covered}/{chains.length} chains have both playbooks and skills</Text>
+        <Button key="chempty" plain dimColor label={cv.showEmpty ? 'hide empty chains' : 'show empty chains'}
+          onPress={() => update($, chainView, x => ({ ...x, showEmpty: !x.showEmpty }))} />
+      </Box>
+      {rows.map(r => {
+        const key = r.id || 'unassigned'
+        const isOpen = cv.expanded.includes(key)
+        const gap = r.id && r.id !== 'infrastructure' && r.playbooks.length === 0 ? 'no playbooks' : r.id && r.skills.length === 0 ? 'no skills' : ''
+        return (
+          <Box key={`ch-${key}`} flexDirection="column">
+            <Box flexDirection="row" gap={1}>
+              <Button key={`chx-${key}`} plain label={`${isOpen ? '▾' : '▸'} ${r.label}`} dimColor={!r.id} onPress={() => toggle(key)} />
+              <Text dimColor>{r.playbooks.length} playbooks ({r.activePlaybooks} active) · {r.skills.length} skills ({r.enabledSkills} on)</Text>
+              {gap && <Text color="yellow">{gap}</Text>}
+            </Box>
+            {isOpen && (
+              <Box flexDirection="column" paddingLeft={4} marginBottom={1}>
+                {r.stages.length > 0 && <Text dimColor>Stages covered: {r.stages.join(' → ')}</Text>}
+                <Text bold>Playbooks</Text>
+                {r.playbooks.length === 0 && <Text dimColor>  none</Text>}
+                {r.playbooks.map(p => (
+                  <Box key={`chp-${key}-${p.path}`} flexDirection="row" gap={1}>
+                    <Button key={`chpr-${key}-${p.path}`} plain label="▶" onPress={() => withBusy($, `Run ${p.title}`, async () => {
+                      await runPlaybook($, p)
+                      $.ui.toast(`Running playbook: ${p.title}`)
+                    })} />
+                    <Button key={`chpo-${key}-${p.path}`} plain label={p.title} onPress={async () => {
+                      await update($, pbView, x => ({ ...x, selected: p.path }))
+                      await loadPlaybookDetail($, p.path)
+                      await update($, view, x => ({ ...x, tab: 'playbooks' as Tab }))
+                    }} />
+                    <Text dimColor>{[p.status, p.coverage.join(', ')].filter(Boolean).join(' · ')}</Text>
+                  </Box>
+                ))}
+                <Text bold>Skills</Text>
+                {r.skills.length === 0 && <Text dimColor>  none</Text>}
+                {r.skills.map(s => (
+                  <Box key={`chs-${key}-${s.folder}`} flexDirection="row" gap={1}>
+                    <Text dimColor={s.meta.disableModelInvocation}>  {s.meta.name}</Text>
+                    {r.id ? (
+                      <Button key={`chsr-${key}-${s.folder}`} plain dimColor label="remove"
+                        onPress={() => withBusy($, 'Value chain', () => setSkillChains($, s.folder, s.meta.valueChains.filter(c => c !== r.id)))} />
+                    ) : hasFields ? (
+                      <Select key={`chsa-${s.folder}`} label="assign" value="" options={[{ value: '', label: '—' }, ...chains.map(c => ({ value: c.id, label: c.label }))]}
+                        onSelect={(c: string) => c ? withBusy($, 'Value chain', () => setSkillChains($, s.folder, [c])) : undefined} />
+                    ) : null}
+                  </Box>
+                ))}
+              </Box>
+            )}
+          </Box>
+        )
+      })}
+    </Box>
+  )
+}
+
 // ─── Hooks ───────────────────────────────────────────────────
 
 export const register: Register = (on, options) => {
@@ -1075,15 +1404,20 @@ export const register: Register = (on, options) => {
       description: 'Skills Manager: manage SKILL.md skills (no args opens the pane; "help" lists subcommands)',
       argumentHint: '[list|install|enable|disable|update|browse|help …]',
     })
+    await $.command.register({
+      name: 'playbook',
+      description: 'Run a playbook (type: playbook note) by name; no args opens the Playbooks tab',
+      argumentHint: '[playbook name] [context]',
+    })
     await $.tool.register({
       name: 'skills',
-      description: 'Manage the AI agent skills (SKILL.md folders) in the configured skills directory: list/search, show details and security scan, enable/disable (disable-model-invocation), set category or user-invocable, install from GitHub/monorepo/skills.sh/local folder/ZIP, list release versions, check for and apply updates, freeze versions, browse the marketplace, export to other AI tools, regenerate SKILLS.md.',
+      description: 'Manage the AI agent skills (SKILL.md folders) in the configured skills directory: list/search, show details and security scan, enable/disable (disable-model-invocation), set category or user-invocable, install from GitHub/monorepo/skills.sh/local folder/ZIP, list release versions, check for and apply updates, freeze versions, browse the marketplace, export to other AI tools, regenerate SKILLS.md. Also playbooks (notes with type: playbook): list/search, show, run (returns the run instructions), pin, set status or value chain. And value chains: the chain matrix with gaps, one chain\'s playbooks and skills, add/remove a skill\'s value-chains.',
       inputSchema: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['list', 'show', 'rescan', 'enable', 'disable', 'invocable', 'category', 'freeze', 'install', 'versions', 'check-updates', 'update', 'browse', 'export', 'index'] },
+          action: { type: 'string', enum: ['list', 'show', 'rescan', 'enable', 'disable', 'invocable', 'category', 'freeze', 'install', 'versions', 'check-updates', 'update', 'browse', 'export', 'index', 'playbooks', 'playbook', 'run', 'pin', 'playbook-status', 'playbook-chain', 'chains', 'chain-add', 'chain-remove'] },
           target: { type: 'string', description: 'Skill folder/name; enable/disable also take a category or "all"; install takes owner/repo, owner/repo/path, a URL, a folder or a .zip; list/browse take a query; versions takes owner/repo' },
-          value: { type: 'string', description: 'install/update: version tag; category: the category; invocable: on|off' },
+          value: { type: 'string', description: 'install/update: version tag; category: the category; invocable: on|off; playbook-status: draft|active|retired; playbook-chain and chain-add/remove: the chain id; run: extra context' },
         },
         required: ['action'],
       },
@@ -1101,10 +1435,28 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  on('command.run', { command: 'playbook' }, async ($, e) => {
+    const text = e.args.trim()
+    if (!text) {
+      await refresh($)
+      await refreshPlaybooks($)
+      await update($, view, x => ({ ...x, tab: 'playbooks' as Tab }))
+      await $.ui.open({ id: PANE, title: 'Skills Manager', focus: true })
+      return { text: 'Playbooks opened.' }
+    }
+    const [arg = '', ...rest] = text.split(/\s+/)
+    try {
+      return { text: await act($, 'run', arg, rest.join(' ')) }
+    } catch (err) {
+      return { text: errText(err) }
+    }
+  })
+
   on('command.run', { command: 'skills' }, async ($, e) => {
     const [sub = '', arg = '', ...rest] = e.args.trim().split(/\s+/).filter(Boolean)
     if (!sub || sub === 'open' || sub === 'view') {
       await refresh($)
+      await refreshPlaybooks($)
       await $.ui.open({ id: PANE, title: 'Skills Manager', focus: true })
       return { text: `Skills Manager opened (${O.skillsDir}).` }
     }
@@ -1119,7 +1471,7 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__skills-manager__skills' }, async ($, e) => {
     const input = e as unknown as { action: string; target?: string; value?: string }
     try {
-      return { result: await act($, input.action, input.target ?? '', input.value ?? '') }
+      return { result: await act($, input.action, input.target ?? '', input.value ?? '', true) }
     } catch (err) {
       return { result: `Error: ${errText(err)}` }
     }
@@ -1132,7 +1484,9 @@ export const register: Register = (on, options) => {
     const v = await read($, view)
     const b = await read($, busy)
     let body
-    if (v.tab === 'marketplace') body = renderMarket(ui, $, await read($, market), hasFields)
+    if (v.tab === 'playbooks') body = renderPlaybooks(ui, $, await read($, playbooks), await read($, pbView), await read($, pbDetail), hasFields)
+    else if (v.tab === 'chains') body = renderChains(ui, $, await read($, skills), await read($, playbooks), await read($, chainView), hasFields)
+    else if (v.tab === 'marketplace') body = renderMarket(ui, $, await read($, market), hasFields)
     else if (v.tab === 'add') body = renderAdd(ui, $, await read($, addForm), hasFields)
     else body = renderInstalled(ui, $, await read($, skills), v, await read($, detail), hasFields)
     return (

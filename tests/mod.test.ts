@@ -3,7 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 // An in-memory skills folder beneath the plugin: fs.list / read / write / exists.
 // The engine hands these hooks absolute paths; files are keyed relative to the cwd.
 function vault(on: any, files: Record<string, string>) {
-  const rel = (p: string) => p.replace(/^\/.*?\/(?=\.claude\/|SKILLS\.md$)/, '')
+  const rel = (p: string) => p.replace(/^\/.*?\/(?=(?:\.claude|00-CORE|10-ME|20-COMPANY|30-CLIENTS)(?:\/|$)|SKILLS\.md$)/, '')
   const dirsOf = (path: string) => {
     const prefix = `${path.replace(/\/+$/, '')}/`
     const names = new Map<string, 'file' | 'dir'>()
@@ -65,6 +65,76 @@ test('pane toggles a skill on every surface with fields', async ($, on) => {
     await ui.press({ key: 'on-alpha' })
     expect(files['.claude/skills/alpha/SKILL.md']).toContain('disable-model-invocation: true')
     await ui.press({ key: 'exp-research' }) // view state is shared across mounts: collapse again
+    await ui.unmount()
+  }
+})
+
+const playbook = (title: string, chain: string) =>
+  `---\ntype: playbook\ntitle: ${title}\ntrigger: t\noutcome: o\nstatus: draft\nvalue-chain: ${chain}\ntotal-steps: 3\n---\nSteps\n`
+
+test('playbooks: list, status, run and value chains', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  const prompts: string[] = []
+  on('prompt.submit', ($2: any, e: any) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  const files = vault(on, {
+    '.claude/skills/crm/SKILL.md': skill('crm'),
+    '00-CORE/Playbooks/close-deal.md': playbook('Close a deal', 'lead-to-cash'),
+    '00-CORE/Playbooks/templates/tpl.md': playbook('Template', 'lead-to-cash'),
+    '30-CLIENTS/acme/Playbooks/onboard.md': playbook('Onboard Acme', ''),
+    '00-CORE/Playbooks/readme.md': '# not a playbook',
+  })
+  const listed = await $.command.run({ command: 'skills', args: 'playbooks' })
+  expect(listed.text).toContain('Close a deal')
+  expect(listed.text).toContain('Onboard Acme')
+  expect(listed.text).not.toContain('Template')
+
+  await $.command.run({ command: 'skills', args: 'playbook-status Close a deal active' })
+  expect(files['00-CORE/Playbooks/close-deal.md']).toContain('status: active')
+
+  const ran = await $.command.run({ command: 'playbook', args: 'Close a deal' })
+  expect(ran.text).toContain('Running playbook')
+  await clock.advance(10)
+  expect(prompts[0]).toContain('00-CORE/Playbooks/close-deal.md')
+
+  await $.command.run({ command: 'skills', args: 'chain-add crm lead-to-cash' })
+  expect(files['.claude/skills/crm/SKILL.md']).toContain('value-chains: [lead-to-cash]')
+  const chains = await $.command.run({ command: 'skills', args: 'chains lead-to-cash' })
+  expect(chains.text).toContain('Close a deal')
+  expect(chains.text).toContain('crm')
+  const matrix = await $.command.run({ command: 'skills', args: 'chains' })
+  expect(matrix.text).toContain('Unassigned')
+})
+
+test('pane: playbook pin, run and chains tab on every surface with fields', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  const prompts: string[] = []
+  on('prompt.submit', ($2: any, e: any) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+  vault(on, { '00-CORE/Playbooks/close-deal.md': playbook('Close a deal', 'lead-to-cash') })
+  const props = { title: 'Skills Manager', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} }
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'skills-manager', surface, component: 'Pane', requestId: 'skills-manager', props } as any)
+    await ui.press({ key: 'tab-playbooks' })
+    const pinKey = 'pin-00-CORE/Playbooks/close-deal.md'
+    expect((await ui.find({ key: pinKey }))?.text).toContain('☆')
+    await ui.press({ key: pinKey })
+    expect((await ui.find({ key: pinKey }))?.text).toContain('★')
+    await ui.press({ key: pinKey })
+    await ui.press({ key: 'run-00-CORE/Playbooks/close-deal.md' })
+    await clock.advance(10)
+    expect(prompts.at(-1)).toContain('Close a deal')
+    await ui.press({ key: 'tab-chains' })
+    await ui.press({ key: 'chx-lead-to-cash' })
+    expect(await ui.find({ key: 'chpo-lead-to-cash-00-CORE/Playbooks/close-deal.md' })).toBeDefined()
+    await ui.press({ key: 'chx-lead-to-cash' })
+    await ui.press({ key: 'tab-installed' })
     await ui.unmount()
   }
 })

@@ -12,6 +12,7 @@ export type SkillMeta = {
   license?: string
   compatibility?: string
   allowedTools?: string
+  valueChains: string[]
 }
 
 export type Threat = { severity: 'warning' | 'danger'; file: string; description: string }
@@ -34,7 +35,7 @@ export type SkillState = {
 
 export type SkillRow = { folder: string; meta: SkillMeta; state?: SkillState; risk: ScanResult['riskLevel'] }
 
-export type Tab = 'installed' | 'marketplace' | 'add'
+export type Tab = 'installed' | 'playbooks' | 'chains' | 'marketplace' | 'add'
 
 export type View = {
   tab: Tab
@@ -69,6 +70,26 @@ export type AddForm = {
   zip: { tmp: string; skills: { dir: string; folder: string; name: string }[] } | null
 }
 
+export type PlaybookRow = {
+  path: string
+  title: string
+  trigger: string
+  outcome: string
+  status: string
+  valueChain: string
+  coverage: string[]
+  maturity: string[]
+  tags: string[]
+  steps?: number
+  duration: string
+  pricingTier: string
+  isPinned: boolean
+}
+
+export type PlaybookView = { search: string; status: string; chain: string; maturity: string; selected: string }
+export type PlaybookDetail = { path: string; body: string } | null
+export type ChainView = { expanded: string[]; showEmpty: boolean }
+
 declare module 'claude-code' {
   interface PluginState {
     'skills-manager': {
@@ -78,6 +99,10 @@ declare module 'claude-code' {
       market: Market
       add: AddForm
       busy: string
+      playbooks: PlaybookRow[]
+      pbView: PlaybookView
+      pbDetail: PlaybookDetail
+      chainView: ChainView
     }
   }
 }

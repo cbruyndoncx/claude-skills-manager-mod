@@ -77,3 +77,58 @@ describe('zip, security, index', () => {
     expect(out).toContain('`/a` → `.claude/skills/a/SKILL.md`')
   })
 })
+
+import { chainList, chainMatrix } from '../hooks/lib/chains'
+import { parseList, setList } from '../hooks/lib/frontmatter'
+import { filterPlaybooks, findPlaybook, runPrompt, toPlaybook } from '../hooks/lib/playbooks'
+
+const PB = '---\ntype: playbook\ntitle: Close a deal\ntrigger: Proposal accepted\noutcome: Signed contract\nstatus: active\nvalue-chain: lead-to-cash\nchain-coverage:\n  - propose\n  - close\nmaturity: [traction, scaling]\ntotal-steps: 6\n---\n# Steps\n'
+
+describe('lists', () => {
+  test('parses inline, block and scalar lists', () => {
+    expect(parseList(PB, 'chain-coverage')).toEqual(['propose', 'close'])
+    expect(parseList(PB, 'maturity')).toEqual(['traction', 'scaling'])
+    expect(parseList(PB, 'value-chain')).toEqual(['lead-to-cash'])
+    expect(parseList(PB, 'missing')).toEqual([])
+  })
+  test('setList rewrites block and inline forms, or appends', () => {
+    const out = setList(PB, 'chain-coverage', ['close'])
+    expect(out).toContain('chain-coverage: [close]\nmaturity')
+    expect(out).not.toContain('  - propose')
+    expect(setList(MD, 'value-chains', ['a', 'b'])).toContain('value-chains: [a, b]\n---')
+  })
+})
+
+describe('playbooks and chains', () => {
+  test('reads playbook notes only', () => {
+    const p = toPlaybook('00-CORE/Playbooks/close.md', PB, ['00-CORE/Playbooks/close.md'])!
+    expect(p.title).toBe('Close a deal')
+    expect(p.steps).toBe(6)
+    expect(p.coverage).toEqual(['propose', 'close'])
+    expect(p.isPinned).toBe(true)
+    expect(toPlaybook('x.md', MD, [])).toBe(null)
+  })
+  test('filters, finds and builds the run prompt', () => {
+    const p = toPlaybook('a/close.md', PB, [])!
+    const q = { ...p, path: 'a/other.md', title: 'Other', status: 'draft', valueChain: '', maturity: [], isPinned: true }
+    const base = { search: '', status: '', chain: '', maturity: '', selected: '' }
+    expect(filterPlaybooks([p, q], base).map(x => x.title)).toEqual(['Other', 'Close a deal'])
+    expect(filterPlaybooks([p, q], { ...base, chain: '(none)' }).map(x => x.title)).toEqual(['Other'])
+    expect(filterPlaybooks([p, q], { ...base, maturity: 'scaling' }).length).toBe(1)
+    expect(findPlaybook([p, q], 'close')?.title).toBe('Close a deal')
+    expect(runPrompt(p, true)).toBe('/playbook-runner Close a deal')
+    expect(runPrompt(p, false)).toContain('a/close.md')
+  })
+  test('matrix counts per chain, gaps and unassigned', () => {
+    const p = toPlaybook('a/close.md', PB, [])!
+    const sk = { folder: 'crm', meta: { ...toSkillMeta(MD, 'u')!, valueChains: ['lead-to-cash', 'custom-chain'] }, risk: 'clean' as const }
+    const lone = { folder: 'lone', meta: toSkillMeta(MD, 'u')!, risk: 'clean' as const }
+    const chains = chainList([], [sk], [p])
+    expect(chains.some(c => c.id === 'custom-chain')).toBe(true)
+    const m = chainMatrix(chains, [sk, lone], [p])
+    const ltc = m.find(r => r.id === 'lead-to-cash')!
+    expect([ltc.playbooks.length, ltc.skills.length, ltc.activePlaybooks]).toEqual([1, 1, 1])
+    expect(ltc.stages).toEqual(['propose', 'close'])
+    expect(m.find(r => r.id === '')!.skills.map(s => s.folder)).toEqual(['lone'])
+  })
+})
