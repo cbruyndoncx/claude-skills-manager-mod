@@ -3,7 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 // An in-memory skills folder beneath the plugin: fs.list / read / write / exists.
 // The engine hands these hooks absolute paths; files are keyed relative to the cwd.
 function vault(on: any, files: Record<string, string>) {
-  const rel = (p: string) => p.replace(/^\/.*?\/(?=(?:\.claude|00-CORE|10-ME|20-COMPANY|30-CLIENTS)(?:\/|$)|SKILLS\.md$)/, '')
+  const rel = (p: string) => p.replace(/^\/.*\/(?=(?:\.claude|00-CORE|10-ME|20-COMPANY|30-CLIENTS)(?:\/|$)|SKILLS\.md$)/, '')
   const dirsOf = (path: string) => {
     const prefix = `${path.replace(/\/+$/, '')}/`
     const names = new Map<string, 'file' | 'dir'>()
